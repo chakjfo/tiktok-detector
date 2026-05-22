@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import html
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier, VotingClassifier
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
@@ -48,6 +50,15 @@ MODEL_FEATURES = [
     "uniqueIdLength",
 ]
 
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 @dataclass(frozen=True)
 class ModelBundle:
@@ -79,6 +90,112 @@ def count_digits(value: str) -> int:
 def count_special_characters(value: str) -> int:
     count = len(re.findall(r"[^a-zA-Z\s]", value or ""))
     return min(count, 3)
+
+
+def safe_int(value: object, default: int = 0) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def find_user_info(payload: object) -> dict[str, object] | None:
+    if isinstance(payload, dict):
+        user_info = payload.get("userInfo")
+        if isinstance(user_info, dict) and "user" in user_info and "stats" in user_info:
+            return user_info
+
+        user_module = payload.get("UserModule")
+        if isinstance(user_module, dict):
+            users = user_module.get("users")
+            stats = user_module.get("stats")
+            if isinstance(users, dict) and isinstance(stats, dict) and users:
+                unique_id, user = next(iter(users.items()))
+                return {
+                    "user": user,
+                    "stats": stats.get(unique_id, {}),
+                }
+
+        for value in payload.values():
+            found = find_user_info(value)
+            if found is not None:
+                return found
+
+    if isinstance(payload, list):
+        for value in payload:
+            found = find_user_info(value)
+            if found is not None:
+                return found
+
+    return None
+
+
+def extract_embedded_json(page_html: str) -> list[dict[str, object]]:
+    payloads = []
+    script_patterns = [
+        r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+        r'<script[^>]+id="SIGI_STATE"[^>]*>(.*?)</script>',
+    ]
+    for pattern in script_patterns:
+        match = re.search(pattern, page_html, flags=re.DOTALL)
+        if not match:
+            continue
+        raw_json = html.unescape(match.group(1)).strip()
+        try:
+            payloads.append(json.loads(raw_json))
+        except json.JSONDecodeError:
+            continue
+    return payloads
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_profile_features(profile_link: str, username: str) -> tuple[pd.DataFrame, dict[str, object]]:
+    url = f"https://www.tiktok.com/@{username}"
+    response = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
+    response.raise_for_status()
+
+    for payload in extract_embedded_json(response.text):
+        user_info = find_user_info(payload)
+        if user_info is None:
+            continue
+
+        user = user_info.get("user", {})
+        stats = user_info.get("stats", {})
+        if not isinstance(user, dict) or not isinstance(stats, dict):
+            continue
+
+        unique_id = str(user.get("uniqueId") or username)
+        nickname = str(user.get("nickname") or unique_id)
+        signature = str(user.get("signature") or "").replace("No bio yet", "")
+
+        features = {
+            "diggCount": safe_int(stats.get("diggCount")),
+            "followerCount": safe_int(stats.get("followerCount")),
+            "followingCount": safe_int(stats.get("followingCount")),
+            "heartCount": safe_int(stats.get("heartCount") or stats.get("heart")),
+            "videoCount": safe_int(stats.get("videoCount")),
+            "downloadSetting": safe_int(user.get("downloadSetting")),
+            "duetSetting": safe_int(user.get("duetSetting")),
+            "openFavorite": int(bool(user.get("openFavorite", False))),
+            "stitchSetting": safe_int(user.get("stitchSetting")),
+            "verified": int(bool(user.get("verified", False))),
+            "signatureLength": len(signature),
+            "nicknameLength": len(nickname),
+            "nicknameNumSpecialCharacters": count_special_characters(nickname),
+            "uniqueIdNumDigits": count_digits(unique_id),
+            "uniqueIdLength": len(unique_id),
+        }
+        profile = {
+            "uniqueId": unique_id,
+            "nickname": nickname,
+            "signature": signature,
+            "profileUrl": profile_link,
+        }
+        return pd.DataFrame([features], columns=MODEL_FEATURES), profile
+
+    raise ValueError("No public TikTok profile metrics were found in the page data.")
 
 
 def normalize_raw_dataset(df: pd.DataFrame) -> pd.DataFrame:
@@ -177,18 +294,9 @@ def train_model() -> ModelBundle:
     return ModelBundle(pipeline=pipeline, metrics=metrics, engine_label=engine_label, dataset_rows=len(df))
 
 
-def find_profile_row(df: pd.DataFrame, username: str) -> pd.Series | None:
-    if not username:
-        return None
-    matches = df[df["uniqueId"].str.lower() == username.lower()]
-    if matches.empty:
-        return None
-    return matches.iloc[0]
-
-
 def build_manual_features(username: str) -> pd.DataFrame:
     with st.form("manual_profile_features"):
-        st.caption("TikTok does not expose these model features from a URL alone in this local repo, so enter the visible profile metrics here.")
+        st.caption("Enter the visible profile metrics, then the trained hybrid model will predict the account class. The app does not search for the username in the training dataset.")
         col1, col2, col3 = st.columns(3)
         digg_count = col1.number_input("Digg count", min_value=0, value=0, step=1)
         follower_count = col2.number_input("Follower count", min_value=0, value=0, step=1)
@@ -270,17 +378,26 @@ def main() -> None:
 
     if username:
         st.caption(f"Parsed username: @{username}")
-        row = find_profile_row(df, username)
-        if row is not None:
-            st.info("This username exists in the local dataset, so the app used its stored profile features.")
-            features = pd.DataFrame([row[MODEL_FEATURES].to_dict()], columns=MODEL_FEATURES)
+        try:
+            with st.spinner("Fetching public TikTok profile metrics..."):
+                features, profile = fetch_profile_features(profile_link, username)
+
             prediction, probability = predict_account(bundle, features)
             render_prediction(prediction, probability)
 
+            st.subheader("Fetched Profile Metrics")
+            profile_cols = st.columns(3)
+            profile_cols[0].metric("Username", f"@{profile['uniqueId']}")
+            profile_cols[1].metric("Display name length", int(features["nicknameLength"].iloc[0]))
+            profile_cols[2].metric("Bio length", int(features["signatureLength"].iloc[0]))
+
             with st.expander("Profile features used"):
                 st.dataframe(features, use_container_width=True)
-        else:
-            st.warning("This username is not in the local dataset. Enter the profile metrics below to classify it.")
+
+        except Exception as exc:
+            st.error("The app could not automatically fetch this profile's public metrics.")
+            st.caption(f"Fetch error: {exc}")
+            st.warning("TikTok sometimes blocks automated page reads or hides profile data. You can still run a model prediction by entering the visible metrics below.")
             features = build_manual_features(username)
             if not features.empty:
                 prediction, probability = predict_account(bundle, features)

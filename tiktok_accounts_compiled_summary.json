@@ -1,0 +1,50 @@
+{
+  "source_raw_dataset": "datasets\\tiktok_accounts.csv",
+  "source_cleaned_dataset": "datasets\\tiktok_accounts_cleaned.csv",
+  "compiled_dataset": "datasets\\tiktok_accounts_compiled.csv",
+  "rows": 10043,
+  "columns": 16,
+  "raw_columns": [
+    "diggCount",
+    "followerCount",
+    "followingCount",
+    "heartCount",
+    "videoCount",
+    "commentSetting",
+    "downloadSetting",
+    "duetSetting",
+    "nickname",
+    "openFavorite",
+    "signature",
+    "stitchSetting",
+    "uniqueId",
+    "verified",
+    "fake"
+  ],
+  "compiled_columns": [
+    "diggCount",
+    "followerCount",
+    "followingCount",
+    "heartCount",
+    "videoCount",
+    "downloadSetting",
+    "duetSetting",
+    "openFavorite",
+    "stitchSetting",
+    "verified",
+    "signatureLength",
+    "nicknameLength",
+    "nicknameNumSpecialCharacters",
+    "uniqueIdNumDigits",
+    "uniqueIdLength",
+    "fake"
+  ],
+  "raw_fake_distribution": {
+    "True": 5029,
+    "False": 5014
+  },
+  "compiled_fake_distribution": {
+    "1": 5029,
+    "0": 5014
+  }
+}
